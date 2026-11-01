@@ -1,15 +1,15 @@
 import argparse
 import logging
-import hashlib
 import re
-from urllib.parse import urlparse
+import sys
+from urllib.parse import urlparse, urlunparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Regular expressions for indicator validation
 IP_REGEX = re.compile(r'^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$')
-DOMAIN_REGEX = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$')
+DOMAIN_REGEX = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$', re.IGNORECASE)
 URL_REGEX = re.compile(
     r'^(?:http|ftp)s?://'  # http(s) or ftp(s)
     r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain
@@ -17,8 +17,51 @@ URL_REGEX = re.compile(
     r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or ip
     r'(?::\d+)?'  # optional port
     r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-# This pattern accepts lowercase hex only, so an uppercase hash, which feeds publish constantly, fails validation and is dropped as invalid rather than deduplicated. The domain pattern above has the same lowercase only shape, while the URL pattern is the one place I bothered with IGNORECASE.
-HASH_REGEX = re.compile(r'^[a-f0-9]{32,128}$')  # Basic hash check
+HASH_REGEX = re.compile(r'^[a-f0-9]{32,128}$', re.IGNORECASE)  # Basic hash check
+
+DEFAULT_PORTS = {'http': 80, 'https': 443, 'ftp': 21}
+
+
+def normalize_indicator(indicator, indicator_type='auto'):
+    """
+    Normalizes an indicator before validation and deduplication:
+    domains and hashes are case folded, a trailing dot is stripped
+    from domains and URL hosts, and URLs get a lowercase scheme and
+    host with any default port removed.
+    """
+    value = indicator.strip()
+
+    if indicator_type == 'hash':
+        return value.lower()
+    if indicator_type == 'domain':
+        return value.lower().rstrip('.')
+    if indicator_type == 'ip':
+        return value
+
+    # URL normalization (explicit type or auto detection).
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or '').lower().rstrip('.')
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = host
+        if parsed.username:
+            userinfo = parsed.username
+            if parsed.password:
+                userinfo += f":{parsed.password}"
+            netloc = f"{userinfo}@{netloc}"
+        if port is not None and port != DEFAULT_PORTS.get(scheme):
+            netloc = f"{netloc}:{port}"
+        return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+    if HASH_REGEX.match(value):
+        return value.lower()
+    if DOMAIN_REGEX.match(value.lower().rstrip('.')):
+        return value.lower().rstrip('.')
+    return value
 
 
 def setup_argparse():
@@ -78,34 +121,34 @@ def process_indicators(input_file, output_file, indicator_type='auto'):
         output_file (str): Path to the output file.
     """
     unique_indicators = set()
+    dropped_count = 0
 
-    try:
-        with open(input_file, 'r') as infile:
-            for line in infile:
-                indicator = line.strip()
-                if not indicator:  # Skip empty lines
-                    continue
+    with open(input_file, 'r') as infile:
+        for line in infile:
+            indicator = line.strip()
+            if not indicator:  # Skip empty lines
+                continue
 
-                if validate_indicator(indicator, indicator_type):
-                    # Deduplication is exact string identity. I never normalise case, strip a trailing dot from a domain, or fold a default port out of a URL, despite importing urlparse at the top, so the same indicator in two spellings survives as two entries.
-                    unique_indicators.add(indicator)  # Add to the set (duplicates are automatically removed)
-                else:
-                    logging.warning(f"Invalid indicator found: {indicator}. Skipping.")
+            normalized = normalize_indicator(indicator, indicator_type)
+            if validate_indicator(normalized, indicator_type):
+                unique_indicators.add(normalized)  # Add to the set (duplicates are automatically removed)
+            else:
+                dropped_count += 1
+                logging.warning(f"Invalid indicator found: {indicator}. Skipping.")
 
-        with open(output_file, 'w') as outfile:
-            # Sorting is plain string order across all types mixed together, so hashes, addresses, and names interleave by their first character. The output is stable and diff friendly, which is what I actually need from it, but it is not grouped by type.
-            for indicator in sorted(unique_indicators):  # Sorting for consistent output
-                outfile.write(indicator + '\n')
+    if dropped_count:
+        logging.warning(f"Dropped {dropped_count} invalid indicator(s).")
 
-        logging.info(f"Successfully processed {len(unique_indicators)} unique indicators.")
+    if not unique_indicators:
+        logging.error("No valid indicators were processed.")
+        return 0
 
-    # A missing input file ends here as a logged error and nothing more. main returns normally afterwards, so the process exits 0 with no output file written, and a pipeline downstream sees a successful run that produced nothing.
-    except FileNotFoundError:
-        logging.error(f"Input file not found: {input_file}")
-    except IOError as e:
-        logging.error(f"IOError: {e}")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+    with open(output_file, 'w') as outfile:
+        for indicator in sorted(unique_indicators):  # Sorting for consistent output
+            outfile.write(indicator + '\n')
+
+    logging.info(f"Successfully processed {len(unique_indicators)} unique indicators.")
+    return len(unique_indicators)
 
 
 def main():
@@ -120,7 +163,21 @@ def main():
 
     logging.debug("Starting indicator deduplication...")
 
-    process_indicators(args.input_file, args.output_file, args.indicator_type)
+    try:
+        processed = process_indicators(args.input_file, args.output_file, args.indicator_type)
+    except FileNotFoundError:
+        logging.error(f"Input file not found: {args.input_file}")
+        sys.exit(1)
+    except IOError as e:
+        logging.error(f"IOError: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
+
+    if not processed:
+        logging.error("Indicator deduplication did not process any valid indicators.")
+        sys.exit(1)
 
     logging.debug("Indicator deduplication completed.")
 
