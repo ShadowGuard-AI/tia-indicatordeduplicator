@@ -17,6 +17,7 @@ URL_REGEX = re.compile(
     r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or ip
     r'(?::\d+)?'  # optional port
     r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+# This pattern accepts lowercase hex only, so an uppercase hash, which feeds publish constantly, fails validation and is dropped as invalid rather than deduplicated. The domain pattern above has the same lowercase only shape, while the URL pattern is the one place I bothered with IGNORECASE.
 HASH_REGEX = re.compile(r'^[a-f0-9]{32,128}$')  # Basic hash check
 
 
@@ -86,16 +87,19 @@ def process_indicators(input_file, output_file, indicator_type='auto'):
                     continue
 
                 if validate_indicator(indicator, indicator_type):
+                    # Deduplication is exact string identity. I never normalise case, strip a trailing dot from a domain, or fold a default port out of a URL, despite importing urlparse at the top, so the same indicator in two spellings survives as two entries.
                     unique_indicators.add(indicator)  # Add to the set (duplicates are automatically removed)
                 else:
                     logging.warning(f"Invalid indicator found: {indicator}. Skipping.")
 
         with open(output_file, 'w') as outfile:
+            # Sorting is plain string order across all types mixed together, so hashes, addresses, and names interleave by their first character. The output is stable and diff friendly, which is what I actually need from it, but it is not grouped by type.
             for indicator in sorted(unique_indicators):  # Sorting for consistent output
                 outfile.write(indicator + '\n')
 
         logging.info(f"Successfully processed {len(unique_indicators)} unique indicators.")
 
+    # A missing input file ends here as a logged error and nothing more. main returns normally afterwards, so the process exits 0 with no output file written, and a pipeline downstream sees a successful run that produced nothing.
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
     except IOError as e:
