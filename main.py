@@ -14,6 +14,7 @@ URL_REGEX = re.compile(
     r'^(?:http|ftp)s?://'  # http(s) or ftp(s)
     r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain
     r'localhost|'  # localhost
+    r'\[[0-9a-fA-F:]+\]|'  # or bracketed IPv6
     r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or ip
     r'(?::\d+)?'  # optional port
     r'(?:/?|[/?]\S+)$', re.IGNORECASE)
@@ -46,8 +47,11 @@ def normalize_indicator(indicator, indicator_type='auto'):
         try:
             port = parsed.port
         except ValueError:
-            port = None
-        netloc = host
+            # A non-numeric or out-of-range port makes the URL invalid.
+            # Return it unchanged so validation rejects it, instead of
+            # silently dropping the port and accepting a rewritten URL.
+            return value
+        netloc = f"[{host}]" if ':' in host else host
         if parsed.username:
             userinfo = parsed.username
             if parsed.password:
@@ -79,6 +83,19 @@ def setup_argparse():
     return parser
 
 
+def _valid_url(indicator):
+    """A URL is valid only if it matches the URL pattern and its port,
+    when present, is numeric and in range (urlparse raises ValueError
+    for a port that is not)."""
+    if not URL_REGEX.match(indicator):
+        return False
+    try:
+        urlparse(indicator).port
+    except ValueError:
+        return False
+    return True
+
+
 def validate_indicator(indicator, indicator_type='auto'):
     """
     Validates if an indicator matches the specified type.
@@ -96,13 +113,13 @@ def validate_indicator(indicator, indicator_type='auto'):
         elif indicator_type == 'domain':
             return bool(DOMAIN_REGEX.match(indicator))
         elif indicator_type == 'url':
-            return bool(URL_REGEX.match(indicator))
+            return _valid_url(indicator)
         elif indicator_type == 'hash':
             return bool(HASH_REGEX.match(indicator))
         elif indicator_type == 'auto':
             return any([bool(IP_REGEX.match(indicator)),
                         bool(DOMAIN_REGEX.match(indicator)),
-                        bool(URL_REGEX.match(indicator)),
+                        _valid_url(indicator),
                         bool(HASH_REGEX.match(indicator))])
         else:
             logging.error(f"Invalid indicator type specified: {indicator_type}")
